@@ -31,7 +31,7 @@ export function fetchMeta(signal) {
 }
 
 /**
- * @param {{ from: string|number, to: string|number, filters: object }} params
+ * @param {{ from: string|number, to: string|number, filters: object, minLoss?: number }} params
  */
 export function fetchGraph(params, signal) {
   return postJson('/api/graph', params, signal)

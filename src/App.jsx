@@ -3,18 +3,28 @@ import './App.css'
 import GraphCanvas from './components/GraphCanvas.jsx'
 import TimePicker from './components/TimePicker.jsx'
 import NetspaceFilter from './components/NetspaceFilter.jsx'
+import LossThresholdPicker from './components/LossThresholdPicker.jsx'
 import EdgeTooltip from './components/EdgeTooltip.jsx'
 import LossLegend from './components/LossLegend.jsx'
 import NetworkQualityStrip from './components/NetworkQualityStrip.jsx'
 import { useGraphData } from './hooks/useGraphData.js'
 import { fetchMeta } from './lib/api.js'
 import { DEFAULT_RANGE, describeRange, fmtDuration, isRelative } from './lib/time.js'
-import { readNetspacesFromUrl, readRangeFromUrl, writeUrlState } from './lib/url-state.js'
+import { DEFAULT_LOSS_THRESHOLD } from './lib/loss-threshold.js'
+import {
+  readLossFromUrl,
+  readNetspacesFromUrl,
+  readRangeFromUrl,
+  writeUrlState,
+} from './lib/url-state.js'
 
 export default function App() {
   const [range, setRange] = useState(() => readRangeFromUrl(DEFAULT_RANGE))
   const [meta, setMeta] = useState(null)
   const [selectedNs, setSelectedNs] = useState(null) // Set | null (=all)
+  const [lossThreshold, setLossThreshold] = useState(() =>
+    readLossFromUrl(DEFAULT_LOSS_THRESHOLD),
+  )
   const [hoverPayload, setHoverPayload] = useState(null)
   const [pinnedPayload, setPinnedPayload] = useState(null)
   const stageRef = useRef(null)
@@ -39,6 +49,7 @@ export default function App() {
     const onPopState = () => {
       setRange(readRangeFromUrl(DEFAULT_RANGE))
       if (meta?.netspaces) setSelectedNs(readNetspacesFromUrl(meta.netspaces))
+      setLossThreshold(readLossFromUrl(DEFAULT_LOSS_THRESHOLD))
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
@@ -51,8 +62,9 @@ export default function App() {
       range,
       selectedNetspaces: selectedNs,
       availableNetspaces: meta.netspaces,
+      lossThreshold,
     })
-  }, [range, selectedNs, meta])
+  }, [range, selectedNs, meta, lossThreshold])
 
   const filters = useMemo(() => {
     if (!meta || !selectedNs) return {}
@@ -61,7 +73,7 @@ export default function App() {
     return { netspaces: [...selectedNs] }
   }, [meta, selectedNs])
 
-  const { data, loading, error, refresh } = useGraphData(range, filters)
+  const { data, loading, error, refresh } = useGraphData(range, filters, lossThreshold)
 
   // Track stage size for tooltip clamping.
   useEffect(() => {
@@ -109,6 +121,7 @@ export default function App() {
             selected={selected}
             onChange={setSelectedNs}
           />
+          <LossThresholdPicker value={lossThreshold} onChange={setLossThreshold} />
           <TimePicker range={range} onChange={setRange} />
           <button
             className="refresh-btn"

@@ -437,6 +437,13 @@
   color: #f0f0f0;
 }
 
+/* ===== Loss-threshold picker (reuses time-picker styling) ============== */
+.loss-popover {
+  grid-template-columns: 1fr 0.8fr;
+  width: min(340px, 92vw);
+}
+.loss-popover .tp-relative ul { max-height: 200px; }
+
 /* ===== Netspace filter ================================================= */
 .netfilter { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .netfilter-label {

@@ -44,6 +44,25 @@ function numOrNull(value) {
 }
 
 /**
+ * Clamp a packet-loss threshold to [0, 100] with hundredth precision.
+ * Returns 0 (no filtering) for anything non-finite.
+ */
+function clampThreshold(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Math.round(Math.max(0, Math.min(100, n)) * 100) / 100
+}
+
+/** Worst-case loss a link reached over the visible range (for the threshold). */
+function worstLinkLoss(link) {
+  const s = link.summary
+  if (!s) return 0
+  if (s.lossMax != null) return s.lossMax
+  if (s.lossAvg != null) return s.lossAvg
+  return 0
+}
+
+/**
  * Compute a summary {sent,recv,lossAvg,lossMax,rttAvg,rttMin,rttMax} from a
  * list of {sent,recv,loss,rttAvg,rttMin,rttMax} buckets.
  */
@@ -253,11 +272,21 @@ export async function getGraph(req) {
     return foldGraph(rows)
   })
 
+  // Packet-loss threshold is applied AFTER the (shared) cache: the heavy query
+  // + fold are reused across thresholds, and links below the threshold are
+  // never serialised to the browser. Nodes/degree stay intact — only links not
+  // matching the filter are dropped, so no other display logic changes.
+  const minLoss = clampThreshold(req.minLoss)
+  const links =
+    minLoss > 0 ? graph.links.filter((l) => worstLinkLoss(l) >= minLoss) : graph.links
+
   return {
     range: { from: fromMs, to: toMs, isLive },
     bucketSeconds,
     filters,
-    ...graph,
+    minLoss,
+    nodes: graph.nodes,
+    links,
   }
 }
 

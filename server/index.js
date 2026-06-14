@@ -78,6 +78,7 @@ async function handleApi(req, res, url) {
           netspaces: url.searchParams.get('netspaces')?.split(',').filter(Boolean),
           families: url.searchParams.get('families')?.split(',').filter(Boolean),
         },
+        minLoss: url.searchParams.get('minLoss'),
       }
     }
     const graph = await getGraph({
@@ -85,6 +86,7 @@ async function handleApi(req, res, url) {
       to: params.to ?? 'now',
       filters: params.filters ?? {},
       maxBuckets: params.maxBuckets,
+      minLoss: params.minLoss,
     })
     sendJson(res, 200, graph)
     return true

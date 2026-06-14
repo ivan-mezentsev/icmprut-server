@@ -1,4 +1,5 @@
 const NETSPACE_VAR = 'var-netspace'
+const LOSS_VAR = 'var-loss'
 
 function currentUrl() {
   if (typeof window === 'undefined') return null
@@ -43,8 +44,19 @@ export function readNetspacesFromUrl(available) {
   return selected.length > 0 ? new Set(selected) : all
 }
 
+/** Read the packet-loss threshold from the URL (var-loss), or a fallback. */
+export function readLossFromUrl(fallback) {
+  const url = currentUrl()
+  if (!url) return fallback
+  const raw = url.searchParams.get(LOSS_VAR)
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(0, Math.min(100, Math.round(n * 100) / 100))
+}
+
 /** Write Grafana-compatible URL state without reloading the page. */
-export function writeUrlState({ range, selectedNetspaces, availableNetspaces }) {
+export function writeUrlState({ range, selectedNetspaces, availableNetspaces, lossThreshold }) {
   const url = currentUrl()
   if (!url || !range || !selectedNetspaces || !availableNetspaces) return
 
@@ -59,6 +71,11 @@ export function writeUrlState({ range, selectedNetspaces, availableNetspaces }) 
     for (const ns of availableNetspaces) {
       if (selectedNetspaces.has(ns)) url.searchParams.append(NETSPACE_VAR, ns)
     }
+  }
+
+  url.searchParams.delete(LOSS_VAR)
+  if (typeof lossThreshold === 'number' && Number.isFinite(lossThreshold)) {
+    url.searchParams.set(LOSS_VAR, String(lossThreshold))
   }
 
   const next = `${url.pathname}${url.search}${url.hash}`
