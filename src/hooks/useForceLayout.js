@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   forceCenter,
   forceLink,
@@ -13,6 +13,15 @@ import {
  * Run a d3-force simulation over the graph nodes/links and expose a live world
  * position map. Positions persist across data refreshes (matched by node id).
  *
+ * Performance contract (Stage 1):
+ *  - The simulation NEVER drives React state. Each tick only mutates the shared
+ *    position map (a ref) and notifies imperative subscribers. The renderer
+ *    coalesces those notifications into at most one canvas redraw per animation
+ *    frame, so a ~270-tick settle no longer triggers 270 React re-renders.
+ *  - `getVersion()` returns a monotonically increasing tick counter used by the
+ *    renderer to invalidate its world-space polyline / spatial-grid cache only
+ *    when positions actually moved (idle pan/zoom/hover reuse the cache).
+ *
  * Layout is tuned to SPREAD across the available area instead of clumping in the
  * centre, and scales its forces with node count so 7 or 200 nodes both fill the
  * canvas nicely. Positions are in "world" coordinates; the camera (zoom/pan)
@@ -22,10 +31,23 @@ export function useForceLayout(graph, width, height) {
   const simRef = useRef(null)
   const nodesRef = useRef(new Map())
   const posRef = useRef(new Map())
-  const [version, setVersion] = useState(0)
   const draggingRef = useRef(null)
   const graphRef = useRef(graph)
   graphRef.current = graph
+
+  // Imperative change notification (no React state on the hot path).
+  const tickSeqRef = useRef(0)
+  const runningRef = useRef(false)
+  const tickSubsRef = useRef(new Set())
+  const settleSubsRef = useRef(new Set())
+
+  const notifyTick = () => {
+    tickSeqRef.current = (tickSeqRef.current + 1) & 0x7fffffff
+    for (const cb of tickSubsRef.current) cb()
+  }
+  const notifySettle = () => {
+    for (const cb of settleSubsRef.current) cb()
+  }
 
   // Structural signature: node ids + undirected link pairs. The simulation is
   // rebuilt ONLY when this changes (first load, filter change). A routine data
@@ -94,53 +116,95 @@ export function useForceLayout(graph, width, height) {
       .alphaDecay(0.025)
 
     const pos = posRef.current
+    // Halt the internal animation timer: we pre-warm the layout SYNCHRONOUSLY
+    // below instead of repainting the whole (near-full) mesh on every one of
+    // the ~270 settle frames. Drag / reheat call restart() to re-enable it.
+    sim.stop()
     sim.on('tick', () => {
       for (const nn of nodes) {
         if (draggingRef.current?.id === nn.id) continue
         pos.set(nn.id, { x: nn.x, y: nn.y })
       }
-      setVersion((v) => (v + 1) & 0xffffff)
+      notifyTick()
+    })
+    sim.on('end', () => {
+      runningRef.current = false
+      notifySettle()
     })
 
     for (const id of [...pos.keys()]) {
       if (!nodeById.has(id)) pos.delete(id)
     }
 
+    // Synchronous pre-warm: advance the layout to a near-stable state in a tight
+    // loop (no rendering), then freeze. The first painted frame is the settled
+    // cloud, not a circle expanding over several seconds.
+    const warmSteps = Math.min(
+      300,
+      Math.ceil(Math.log(sim.alphaMin()) / Math.log(1 - sim.alphaDecay())),
+    )
+    for (let i = 0; i < warmSteps; i += 1) sim.tick()
+    for (const nn of nodes) pos.set(nn.id, { x: nn.x, y: nn.y })
+    runningRef.current = false
+    notifyTick()
+    notifySettle()
+
     simRef.current = sim
     return () => sim.stop()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structSig, width, height])
 
-  const api = {
-    positions: posRef.current,
-    version,
-    reheat() {
-      simRef.current?.alpha(0.8).restart()
-    },
-    startDrag(id, x, y) {
-      const node = nodesRef.current.get(id)
-      if (!node) return
-      draggingRef.current = { id }
-      node.fx = x
-      node.fy = y
-      simRef.current?.alphaTarget(0.2).restart()
-    },
-    drag(id, x, y) {
-      const node = nodesRef.current.get(id)
-      if (!node) return
-      node.fx = x
-      node.fy = y
-      posRef.current.set(id, { x, y })
-    },
-    endDrag(id) {
-      const node = nodesRef.current.get(id)
-      if (node) {
-        node.fx = null
-        node.fy = null
-      }
-      draggingRef.current = null
-      simRef.current?.alphaTarget(0)
-    },
-  }
+  // The API identity must stay STABLE across renders so the renderer can hold a
+  // single RAF subscription. All methods read refs only, so an empty-dep memo
+  // is correct. `positions` is the stable posRef Map instance.
+  const api = useMemo(
+    () => ({
+      positions: posRef.current,
+      getVersion: () => tickSeqRef.current,
+      isRunning: () => runningRef.current,
+      /** Subscribe to per-tick position changes. Returns an unsubscribe fn. */
+      onTick(cb) {
+        tickSubsRef.current.add(cb)
+        return () => tickSubsRef.current.delete(cb)
+      },
+      /** Subscribe to simulation settle ("end"). Returns an unsubscribe fn. */
+      onSettle(cb) {
+        settleSubsRef.current.add(cb)
+        return () => settleSubsRef.current.delete(cb)
+      },
+      reheat() {
+        runningRef.current = true
+        simRef.current?.alpha(0.8).restart()
+      },
+      startDrag(id, x, y) {
+        const node = nodesRef.current.get(id)
+        if (!node) return
+        draggingRef.current = { id }
+        node.fx = x
+        node.fy = y
+        runningRef.current = true
+        simRef.current?.alphaTarget(0.2).restart()
+      },
+      drag(id, x, y) {
+        const node = nodesRef.current.get(id)
+        if (!node) return
+        node.fx = x
+        node.fy = y
+        posRef.current.set(id, { x, y })
+        notifyTick()
+      },
+      endDrag(id) {
+        const node = nodesRef.current.get(id)
+        if (node) {
+          node.fx = null
+          node.fy = null
+        }
+        draggingRef.current = null
+        simRef.current?.alphaTarget(0)
+      },
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
   return api
 }

@@ -68,5 +68,5 @@ export function useCamera() {
 
   const reset = useCallback(() => setCam({ x: 0, y: 0, k: 1 }), [])
 
-  return { cam, worldToScreen, screenToWorld, zoomAt, panBy, fit, reset }
+  return { cam, camRef, worldToScreen, screenToWorld, zoomAt, panBy, fit, reset }
 }

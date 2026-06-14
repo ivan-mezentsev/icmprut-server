@@ -6,12 +6,16 @@ import {
   edgePolyline,
   pointAtU,
 } from '../lib/edge-geometry.js'
+import { buildPolylineGrid } from '../lib/spatial-grid.js'
 import { lossCss, noDataCss } from '../lib/loss-color.js'
 
 const BASE_NODE_RADIUS = 5
 const HOVER_TOLERANCE_PX = 8 // screen-space hit tolerance
 const CLICK_DRAG_THRESHOLD = 4
 const RAIL_TINT = 'rgba(220,220,220,0.065)'
+// Above this link count the canvas switches to a cheap single-segment renderer
+// for non-focused links (one stroke per link instead of one per time bucket).
+const LOD_LINK_THRESHOLD = 600
 
 function dpr() {
   return typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
@@ -52,13 +56,30 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
   const [size, setSize] = useState({ width: 0, height: 0 })
   const layout = useForceLayout(graph, size.width, size.height)
   const camera = useCamera()
+  // Stable camera accessors (memoised in useCamera); only `cam` changes on
+  // pan/zoom. Reading these instead of the whole `camera` object keeps the
+  // imperative draw loop's identity stable across renders.
+  const { cam, camRef, worldToScreen, screenToWorld, zoomAt, panBy, fit } = camera
 
-  const [hover, setHover] = useState(null)
-  const [hoverNode, setHoverNode] = useState(null)
-  const [brush, setBrush] = useState(null)
-  const [pulseFrame, setPulseFrame] = useState(0)
+  // ---- view state lives in REFS (no React re-render on hover/brush/pan) ----
+  // The hot pointer path never calls setState; it mutates these refs and asks
+  // for a single coalesced redraw, so dragging/hovering a near-full mesh no
+  // longer re-renders React thousands of times.
+  const hoverRef = useRef(null) // { linkId, u } | null
+  const hoverNodeRef = useRef(null) // node id | null
+  const brushRef = useRef(null) // { linkId, u0, u1 } | null
   const dragRef = useRef(null) // node drag / pan / brush gesture state
   const fittedRef = useRef(false)
+  const rafRef = useRef(0)
+  const graphRef = useRef(graph)
+  const sizeRef = useRef(size)
+  const activeLinkIdRef = useRef(activeLinkId)
+  const frameNowRef = useRef(Date.now())
+  // World-space polyline + spatial-grid cache, invalidated by sim version.
+  const polyCacheRef = useRef({ version: -1, map: new Map(), grid: null })
+  graphRef.current = graph
+  sizeRef.current = size
+  activeLinkIdRef.current = activeLinkId
 
   const linkById = useMemo(() => {
     const m = new Map()
@@ -93,16 +114,11 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     () => Boolean(graph?.links?.some((l) => l.buckets?.some((b) => b.loss > 0))),
     [graph],
   )
-
-  // Animate only when there is something lossy to pulse. Healthy graphs stay
-  // fully static (no unnecessary redraw loop at production scale).
-  useEffect(() => {
-    if (!hasLossyLinks) return undefined
-    const id = setInterval(() => {
-      setPulseFrame((v) => (v + 1) & 0xffff)
-    }, 160)
-    return () => clearInterval(id)
-  }, [hasLossyLinks])
+  // The pulse only matters where per-bucket ribbons are actually drawn. In
+  // dense (LOD) graphs non-focused links are single segments, so a global pulse
+  // would repaint thousands of links 6×/s for nothing. Restrict it to small,
+  // lossy graphs.
+  const pulseEnabled = hasLossyLinks && (graph?.links?.length ?? 0) <= LOD_LINK_THRESHOLD
 
   // Resize observer.
   useEffect(() => {
@@ -116,63 +132,68 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     return () => ro.disconnect()
   }, [])
 
-  // Auto-fit only when the participant set changes (first load, filter change),
-  // never on a routine data refresh.
-  useEffect(() => {
-    fittedRef.current = false
-  }, [nodeSig])
-  useEffect(() => {
-    if (fittedRef.current) return
-    if (!graph || size.width === 0) return
-    if (layout.positions.size >= graph.nodes.length && graph.nodes.length > 0) {
-      const id = setTimeout(() => {
-        camera.fit(layout.positions, size.width, size.height)
-        fittedRef.current = true
-      }, 350)
-      return () => clearTimeout(id)
-    }
-    return undefined
-  }, [nodeSig, graph, size, layout.positions, layout.version, camera])
-
-  // World polyline cache (rebuilt from positions on demand).
-  const buildPolylines = useCallback(() => {
+  // World polyline + spatial-grid cache. Rebuilt ONLY when the simulation tick
+  // version changes (positions actually moved); idle pan / zoom / hover reuse
+  // it. This is what stops a near-full mesh from reprojecting thousands of
+  // edges on every pointer move.
+  const getPolylines = useCallback(() => {
+    const cache = polyCacheRef.current
+    const version = layout.getVersion()
+    if (cache.version === version && cache.map.size > 0) return cache
     const pos = layout.positions
-    const out = new Map()
-    if (!graph) return out
-    for (const l of graph.links) {
-      const pts = edgePolyline(l, pos, {
-        sourceRadius: BASE_NODE_RADIUS + 1,
-        targetRadius: BASE_NODE_RADIUS + 1,
-        samples: l.selfLoop ? 28 : 16,
-      })
-      if (pts) out.set(l.id, pts)
+    const map = new Map()
+    const g = graphRef.current
+    if (g) {
+      for (const l of g.links) {
+        const pts = edgePolyline(l, pos, {
+          sourceRadius: BASE_NODE_RADIUS + 1,
+          targetRadius: BASE_NODE_RADIUS + 1,
+          // Straight links need only their two endpoints: per-bucket colouring
+          // interpolates along the segment, so extra samples were pure waste
+          // (16× the transform/draw work for thousands of edges). Self-loops
+          // keep enough samples to read as a smooth ring.
+          samples: l.selfLoop ? 28 : 1,
+        })
+        if (pts) map.set(l.id, pts)
+      }
     }
-    return out
-  }, [graph, layout.positions])
+    cache.version = version
+    cache.map = map
+    cache.grid = buildPolylineGrid(map)
+    return cache
+  }, [layout])
 
-  // ---- draw loop -----------------------------------------------------------
-  useEffect(() => {
+  // ---- single coalesced redraw on the next animation frame -----------------
+  const drawNow = useCallback(() => {
     const canvas = canvasRef.current
-    if (!canvas || !graph) return
+    const g = graphRef.current
+    if (!canvas || !g) return
     const ratio = dpr()
-    const { width, height } = size
+    const { width, height } = sizeRef.current
     if (width === 0 || height === 0) return
     if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
       canvas.width = width * ratio
       canvas.height = height * ratio
     }
     const ctx = canvas.getContext('2d')
-    const { k } = camera.cam
+    const cam = camRef.current
+    const k = cam.k
+    const w2s = (wx, wy) => ({ x: (wx - cam.x) * k, y: (wy - cam.y) * k })
     ctx.save()
     ctx.scale(ratio, ratio)
     ctx.clearRect(0, 0, width, height)
 
-    const w2s = camera.worldToScreen
-    const polylines = buildPolylines()
+    const { map: polylines } = getPolylines()
+    const hover = hoverRef.current
+    const hoverNode = hoverNodeRef.current
+    const brush = brushRef.current
     const hoveredLink = hover ? linkById.get(hover.linkId) : null
-    const activePinnedLink = activeLinkId ? linkById.get(activeLinkId) : null
+    const activePinnedLink = activeLinkIdRef.current
+      ? linkById.get(activeLinkIdRef.current)
+      : null
     const activeLink = hoveredLink ?? activePinnedLink
     const frameNow = Date.now()
+    frameNowRef.current = frameNow
     const focusNode = hoverNode
 
     // A node or link is "focused" when hovered. Dimming only kicks in then.
@@ -191,20 +212,30 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     }
 
     // Level-of-detail: hide labels & arrows when zoomed far out / very dense.
-    const showLabels = k > 0.55 && graph.nodes.length <= 160
+    const showLabels = k > 0.55 && g.nodes.length <= 160
     const showRail = k > 0.4
+    // Dense mode: a near-full mesh has thousands of links. Painting every link
+    // as a full per-bucket ribbon is the real cost (60 buckets × 3000 links =
+    // ~180k strokes/frame). In dense mode every NON-focused link is a single
+    // segment tinted by its worst-case loss; the full timeline ribbon is drawn
+    // only for the focused/pinned link (where the user actually reads it).
+    const dense = g.links.length > LOD_LINK_THRESHOLD
 
     // links
-    for (const l of graph.links) {
+    for (const l of g.links) {
       const pts = polylines.get(l.id)
       if (!pts) continue
       const isFocused = linkInFocus(l)
-      drawLinkRibbon(ctx, l, pts, w2s, k, {
-        hovered: isFocused,
-        dimmed: hasFocus && !isFocused,
-        showRail,
-        frameNow,
-      })
+      if (dense && !isFocused) {
+        drawLinkSimple(ctx, l, pts, w2s, k, { dimmed: hasFocus })
+      } else {
+        drawLinkRibbon(ctx, l, pts, w2s, k, {
+          hovered: isFocused,
+          dimmed: hasFocus && !isFocused,
+          showRail,
+          frameNow,
+        })
+      }
     }
 
     if (brush) {
@@ -213,8 +244,9 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     }
 
     // nodes
-    for (const nd of graph.nodes) {
-      const p = layout.positions.get(nd.id)
+    const pos = layout.positions
+    for (const nd of g.nodes) {
+      const p = pos.get(nd.id)
       if (!p) continue
       const s = w2s(p.x, p.y)
       if (s.x < -40 || s.y < -40 || s.x > width + 40 || s.y > height + 40) continue
@@ -227,30 +259,94 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     }
 
     ctx.restore()
-  }, [graph, size, layout.version, hover, hoverNode, activeLinkId, brush, pulseFrame, camera.cam, buildPolylines, linkById, adjacency, layout.positions, camera.worldToScreen])
+  }, [getPolylines, linkById, adjacency, layout, camRef])
+
+  // Schedule at most one redraw per animation frame.
+  const requestDraw = useCallback(() => {
+    if (rafRef.current) return
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0
+      drawNow()
+    })
+  }, [drawNow])
+
+  // Drive redraws from simulation ticks (coalesced) + a settle pass.
+  useEffect(() => {
+    const offTick = layout.onTick(requestDraw)
+    const offSettle = layout.onSettle(requestDraw)
+    requestDraw()
+    return () => {
+      offTick()
+      offSettle()
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = 0
+      }
+    }
+  }, [layout, requestDraw])
+
+  // Redraw when React-level inputs change (data, size, camera, pinned link).
+  useEffect(() => {
+    requestDraw()
+  }, [graph, size, cam, activeLinkId, requestDraw])
+
+  // Pulse only when something lossy is drawn as a ribbon: a low-rate redraw
+  // clock that re-evaluates the glow phase. Healthy or dense graphs never
+  // schedule it.
+  useEffect(() => {
+    if (!pulseEnabled) return undefined
+    const id = setInterval(requestDraw, 160)
+    return () => clearInterval(id)
+  }, [pulseEnabled, requestDraw])
+
+  // Auto-fit only when the participant set changes (first load, filter change),
+  // never on a routine data refresh.
+  useEffect(() => {
+    fittedRef.current = false
+  }, [nodeSig])
+  useEffect(() => {
+    if (fittedRef.current) return
+    if (!graph || size.width === 0) return
+    if (layout.positions.size >= graph.nodes.length && graph.nodes.length > 0) {
+      const id = setTimeout(() => {
+        fit(layout.positions, size.width, size.height)
+        fittedRef.current = true
+        requestDraw()
+      }, 350)
+      return () => clearTimeout(id)
+    }
+    return undefined
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeSig, graph, size, layout, fit, requestDraw])
 
   // ---- hit testing (screen space) -----------------------------------------
   const hitTest = useCallback(
     (sx, sy) => {
-      if (!graph) return null
-      const w2s = camera.worldToScreen
+      const g = graphRef.current
+      if (!g) return null
+      const cam = camRef.current
+      const k = cam.k
+      const w2s = (wx, wy) => ({ x: (wx - cam.x) * k, y: (wy - cam.y) * k })
       // nodes first
-      for (const nd of graph.nodes) {
+      for (const nd of g.nodes) {
         const p = layout.positions.get(nd.id)
         if (!p) continue
         const s = w2s(p.x, p.y)
-        if (Math.hypot(s.x - sx, s.y - sy) <= BASE_NODE_RADIUS * camera.cam.k + 7) {
+        if (Math.hypot(s.x - sx, s.y - sy) <= BASE_NODE_RADIUS * k + 7) {
           return { type: 'node', id: nd.id }
         }
       }
-      // links: project polyline to screen and measure
-      const polylines = buildPolylines()
+      // links: query only edges whose world cells are near the cursor, then
+      // project just those few polylines to screen and measure.
+      const { map: polylines, grid } = getPolylines()
+      const world = { x: sx / k + cam.x, y: sy / k + cam.y }
+      const worldTol = HOVER_TOLERANCE_PX / k
+      const candidates = grid ? grid.query(world.x, world.y, worldTol) : polylines.keys()
       let best = null
-      for (const [linkId, pts] of polylines) {
-        const screenPts = pts.map((pt) => {
-          const s = w2s(pt.x, pt.y)
-          return { x: s.x, y: s.y }
-        })
+      for (const linkId of candidates) {
+        const pts = polylines.get(linkId)
+        if (!pts) continue
+        const screenPts = pts.map((pt) => w2s(pt.x, pt.y))
         const { dist, u } = distanceToPolyline(screenPts, sx, sy)
         if (dist <= HOVER_TOLERANCE_PX && (!best || dist < best.dist)) {
           best = { type: 'link', linkId, u, dist }
@@ -258,7 +354,7 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       }
       return best
     },
-    [graph, layout.positions, buildPolylines, camera],
+    [layout, getPolylines, camRef],
   )
 
   const toLocal = (evt) => {
@@ -278,18 +374,19 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       if (evt.ctrlKey || evt.metaKey) {
         // Trackpad pinch zoom.
         const factor = Math.exp(-evt.deltaY * 0.01)
-        camera.zoomAt(sx, sy, factor)
+        zoomAt(sx, sy, factor)
       } else if (evt.shiftKey) {
-        camera.panBy(-evt.deltaY, 0)
+        panBy(-evt.deltaY, 0)
       } else {
         // Plain wheel zooms (feels natural for a map-like canvas).
         const factor = Math.exp(-evt.deltaY * 0.0015)
-        camera.zoomAt(sx, sy, factor)
+        zoomAt(sx, sy, factor)
       }
+      requestDraw()
     }
     canvas.addEventListener('wheel', onWheel, { passive: false })
     return () => canvas.removeEventListener('wheel', onWheel)
-  }, [camera])
+  }, [zoomAt, panBy, requestDraw])
 
   const onPointerDown = (evt) => {
     if (!graph) return
@@ -297,18 +394,20 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     canvasRef.current.setPointerCapture(evt.pointerId)
     const hit = hitTest(x, y)
     if (hit?.type === 'node') {
-      const world = camera.screenToWorld(x, y)
+      const world = screenToWorld(x, y)
       dragRef.current = { mode: 'node', id: hit.id }
       layout.startDrag(hit.id, world.x, world.y)
     } else if (hit?.type === 'link') {
       dragRef.current = { mode: 'maybe-brush', linkId: hit.linkId, startU: hit.u, x0: x, y0: y }
-      setBrush({ linkId: hit.linkId, u0: hit.u, u1: hit.u, active: true })
+      brushRef.current = { linkId: hit.linkId, u0: hit.u, u1: hit.u, active: true }
+      requestDraw()
     } else {
       // Panning empty space: drop any focus so nothing stays dimmed.
-      setHover(null)
-      setHoverNode(null)
+      hoverRef.current = null
+      hoverNodeRef.current = null
       onEdgeHover?.(null)
       dragRef.current = { mode: 'pan', x0: x, y0: y, lastX: x, lastY: y }
+      requestDraw()
     }
   }
 
@@ -318,23 +417,27 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     const g = dragRef.current
 
     if (g?.mode === 'node') {
-      const world = camera.screenToWorld(x, y)
+      const world = screenToWorld(x, y)
       layout.drag(g.id, world.x, world.y)
       return
     }
     if (g?.mode === 'pan') {
-      camera.panBy(x - g.lastX, y - g.lastY)
+      panBy(x - g.lastX, y - g.lastY)
       g.lastX = x
       g.lastY = y
+      requestDraw()
       return
     }
     if (g?.mode === 'maybe-brush') {
-      const polylines = buildPolylines()
+      const { map: polylines } = getPolylines()
       const pts = polylines.get(g.linkId)
       if (pts) {
-        const screenPts = pts.map((pt) => camera.worldToScreen(pt.x, pt.y))
+        const screenPts = pts.map((pt) => worldToScreen(pt.x, pt.y))
         const { u } = distanceToPolyline(screenPts, x, y)
-        setBrush((b) => (b ? { ...b, u1: u } : b))
+        if (brushRef.current) {
+          brushRef.current = { ...brushRef.current, u1: u }
+          requestDraw()
+        }
       }
       return
     }
@@ -343,53 +446,60 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     const hit = hitTest(x, y)
     if (hit?.type === 'link') {
       const link = linkById.get(hit.linkId)
-      const pts = buildPolylines().get(hit.linkId)
-      const screenPts = pts?.map((pt) => camera.worldToScreen(pt.x, pt.y))
+      const pts = getPolylines().map.get(hit.linkId)
+      const screenPts = pts?.map((pt) => worldToScreen(pt.x, pt.y))
       const worldPt = pointAtU(pts, hit.u)
-      const screenPt = worldPt ? camera.worldToScreen(worldPt.x, worldPt.y) : { x, y }
+      const screenPt = worldPt ? worldToScreen(worldPt.x, worldPt.y) : { x, y }
       const bucket = bucketAtVisualU(link, hit.u, screenPts)
-      setHover({ linkId: hit.linkId, u: hit.u })
-      setHoverNode(null)
+      hoverRef.current = { linkId: hit.linkId, u: hit.u }
+      hoverNodeRef.current = null
       onEdgeHover?.({ edge: link, bucket, u: hit.u, screen: screenPt, screenPath: screenPts })
       canvasRef.current.style.cursor = 'crosshair'
+      requestDraw()
     } else if (hit?.type === 'node') {
-      if (hover) setHover(null)
-      setHoverNode(hit.id)
+      hoverRef.current = null
+      hoverNodeRef.current = hit.id
       onEdgeHover?.(null)
       canvasRef.current.style.cursor = 'grab'
+      requestDraw()
     } else {
-      if (hover) setHover(null)
-      if (hoverNode) setHoverNode(null)
+      const changed = hoverRef.current || hoverNodeRef.current
+      hoverRef.current = null
+      hoverNodeRef.current = null
       onEdgeHover?.(null)
       canvasRef.current.style.cursor = 'default'
+      if (changed) requestDraw()
     }
   }
 
   const finishBrush = useCallback(
     (g, upX, upY) => {
       const link = linkById.get(g.linkId)
+      const brush = brushRef.current
       const lo = Math.min(brush?.u0 ?? g.startU, brush?.u1 ?? g.startU)
       const hi = Math.max(brush?.u0 ?? g.startU, brush?.u1 ?? g.startU)
       const moved = Math.hypot((upX ?? g.x0) - g.x0, (upY ?? g.y0) - g.y0)
-      const pts = buildPolylines().get(g.linkId)
-      const screenPts = pts?.map((pt) => camera.worldToScreen(pt.x, pt.y))
+      const pts = getPolylines().map.get(g.linkId)
+      const screenPts = pts?.map((pt) => worldToScreen(pt.x, pt.y))
       if (link && hi - lo > 0.03 && moved > CLICK_DRAG_THRESHOLD) {
-        const range = rangeFromVisualBrush(link, lo, hi, graph.bucketSeconds, screenPts)
+        const range = rangeFromVisualBrush(link, lo, hi, graphRef.current?.bucketSeconds, screenPts)
         if (range) onRangeSelect?.(range)
-        setBrush(null)
+        brushRef.current = null
+        requestDraw()
         return
       }
       // A click (no meaningful drag) PINS the tooltip so the cursor can enter it
       // (scroll the member list, read values) — essential near screen edges.
       if (link) {
         const worldPt = pointAtU(pts, g.startU)
-        const screenPt = worldPt ? camera.worldToScreen(worldPt.x, worldPt.y) : { x: g.x0, y: g.y0 }
+        const screenPt = worldPt ? worldToScreen(worldPt.x, worldPt.y) : { x: g.x0, y: g.y0 }
         const bucket = bucketAtVisualU(link, g.startU, screenPts)
         onEdgePin?.({ edge: link, bucket, u: g.startU, screen: screenPt, screenPath: screenPts })
       }
-      setBrush(null)
+      brushRef.current = null
+      requestDraw()
     },
-    [brush, linkById, graph, onRangeSelect, onEdgePin, buildPolylines, camera],
+    [linkById, onRangeSelect, onEdgePin, getPolylines, worldToScreen, requestDraw],
   )
 
   const onPointerUp = (evt) => {
@@ -412,14 +522,17 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
   }
 
   const onPointerLeave = () => {
-    setHover(null)
-    setHoverNode(null)
+    const changed = hoverRef.current || hoverNodeRef.current
+    hoverRef.current = null
+    hoverNodeRef.current = null
     onEdgeHover?.(null)
+    if (changed) requestDraw()
   }
 
   // expose fit/reset via double click
   const onDoubleClick = () => {
-    camera.fit(layout.positions, size.width, size.height)
+    fit(layout.positions, size.width, size.height)
+    requestDraw()
   }
 
   return (
@@ -436,9 +549,9 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       />
 
       <div className="camera-controls">
-        <button type="button" title="Zoom in" onClick={() => camera.zoomAt(size.width / 2, size.height / 2, 1.3)}>+</button>
-        <button type="button" title="Zoom out" onClick={() => camera.zoomAt(size.width / 2, size.height / 2, 1 / 1.3)}>−</button>
-        <button type="button" title="Fit to screen" onClick={() => camera.fit(layout.positions, size.width, size.height)}>⤢</button>
+        <button type="button" title="Zoom in" onClick={() => { zoomAt(size.width / 2, size.height / 2, 1.3); requestDraw() }}>+</button>
+        <button type="button" title="Zoom out" onClick={() => { zoomAt(size.width / 2, size.height / 2, 1 / 1.3); requestDraw() }}>−</button>
+        <button type="button" title="Fit to screen" onClick={() => { fit(layout.positions, size.width, size.height); requestDraw() }}>⤢</button>
         <button type="button" title="Re-arrange (reheat)" onClick={() => layout.reheat()}>✦</button>
       </div>
 
@@ -450,6 +563,30 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
 }
 
 // ---- drawing helpers -------------------------------------------------------
+
+/**
+ * Cheap single-segment link for dense graphs: ONE stroke tinted by the link's
+ * worst-case loss (or a no-data hairline). No per-bucket loop, no rail, no now
+ * marker — this is what keeps a near-full mesh at interactive frame rates. The
+ * full per-bucket timeline is still drawn for the focused/pinned link.
+ */
+function drawLinkSimple(ctx, link, pts, w2s, k, { dimmed }) {
+  if (!pts || pts.length === 0) return
+  const worst = link.summary?.lossMax ?? link.summary?.lossAvg ?? null
+  const baseAlpha = dimmed ? 0.1 : 0.7
+  ctx.lineWidth = link.selfLoop ? 1 : Math.max(0.8, 1.2 * Math.min(1.2, k))
+  ctx.lineCap = 'butt'
+  ctx.lineJoin = 'round'
+  ctx.strokeStyle = worst == null ? noDataCss(baseAlpha * 0.7) : lossCss(worst, baseAlpha)
+  ctx.beginPath()
+  const a = w2s(pts[0].x, pts[0].y)
+  ctx.moveTo(a.x, a.y)
+  for (let i = 1; i < pts.length; i += 1) {
+    const s = w2s(pts[i].x, pts[i].y)
+    ctx.lineTo(s.x, s.y)
+  }
+  ctx.stroke()
+}
 
 function drawLinkRibbon(ctx, link, pts, w2s, k, { hovered, dimmed, showRail, frameNow }) {
   const buckets = link.buckets
