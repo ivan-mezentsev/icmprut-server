@@ -254,6 +254,9 @@ export default function GraphCanvas({
     for (const l of g.links) {
       const pts = polylines.get(l.id)
       if (!pts) continue
+      // With a host pinned, hide every link that is not its own — dimming was
+      // not enough; foreign links must be out of the way during investigation.
+      if (selHost && !isHostLink(l)) continue
       const isFocused = linkInFocus(l)
       if (dense && !isFocused) {
         drawLinkSimple(ctx, l, pts, w2s, k, { dimmed: hasFocus })
