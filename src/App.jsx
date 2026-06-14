@@ -13,6 +13,7 @@ import { DEFAULT_RANGE, describeRange, fmtDuration, isRelative } from './lib/tim
 import { DEFAULT_LOSS_THRESHOLD } from './lib/loss-threshold.js'
 import {
   readLossFromUrl,
+  readHostFromUrl,
   readNetspacesFromUrl,
   readRangeFromUrl,
   writeUrlState,
@@ -25,6 +26,7 @@ export default function App() {
   const [lossThreshold, setLossThreshold] = useState(() =>
     readLossFromUrl(DEFAULT_LOSS_THRESHOLD),
   )
+  const [selectedHost, setSelectedHost] = useState(() => readHostFromUrl())
   const [hoverPayload, setHoverPayload] = useState(null)
   const [pinnedPayload, setPinnedPayload] = useState(null)
   const stageRef = useRef(null)
@@ -50,6 +52,7 @@ export default function App() {
       setRange(readRangeFromUrl(DEFAULT_RANGE))
       if (meta?.netspaces) setSelectedNs(readNetspacesFromUrl(meta.netspaces))
       setLossThreshold(readLossFromUrl(DEFAULT_LOSS_THRESHOLD))
+      setSelectedHost(readHostFromUrl())
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
@@ -63,8 +66,9 @@ export default function App() {
       selectedNetspaces: selectedNs,
       availableNetspaces: meta.netspaces,
       lossThreshold,
+      host: selectedHost,
     })
-  }, [range, selectedNs, meta, lossThreshold])
+  }, [range, selectedNs, meta, lossThreshold, selectedHost])
 
   const filters = useMemo(() => {
     if (!meta || !selectedNs) return {}
@@ -73,7 +77,12 @@ export default function App() {
     return { netspaces: [...selectedNs] }
   }, [meta, selectedNs])
 
-  const { data, loading, error, refresh } = useGraphData(range, filters, lossThreshold)
+  const { data, loading, error, refresh } = useGraphData(
+    range,
+    filters,
+    lossThreshold,
+    selectedHost,
+  )
 
   // Track stage size for tooltip clamping.
   useEffect(() => {
@@ -149,6 +158,8 @@ export default function App() {
           <GraphCanvas
             graph={data}
             activeLinkId={pinnedPayload?.edge?.id ?? null}
+            selectedHost={selectedHost}
+            onHostSelect={setSelectedHost}
             onEdgeHover={setHoverPayload}
             onEdgePin={setPinnedPayload}
             onRangeSelect={onRangeSelect}

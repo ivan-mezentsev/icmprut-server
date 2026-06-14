@@ -79,6 +79,7 @@ async function handleApi(req, res, url) {
           families: url.searchParams.get('families')?.split(',').filter(Boolean),
         },
         minLoss: url.searchParams.get('minLoss'),
+        host: url.searchParams.get('host'),
       }
     }
     const graph = await getGraph({
@@ -87,6 +88,7 @@ async function handleApi(req, res, url) {
       filters: params.filters ?? {},
       maxBuckets: params.maxBuckets,
       minLoss: params.minLoss,
+      host: params.host,
     })
     sendJson(res, 200, graph)
     return true

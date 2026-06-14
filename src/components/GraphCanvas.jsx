@@ -50,7 +50,15 @@ function shouldInvertTimeline(screen) {
  *  - onEdgeHover(payload|null)
  *  - onRangeSelect({from,to})
  */
-export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePin, onRangeSelect }) {
+export default function GraphCanvas({
+  graph,
+  activeLinkId,
+  selectedHost = null,
+  onHostSelect,
+  onEdgeHover,
+  onEdgePin,
+  onRangeSelect,
+}) {
   const wrapRef = useRef(null)
   const canvasRef = useRef(null)
   const [size, setSize] = useState({ width: 0, height: 0 })
@@ -74,12 +82,14 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
   const graphRef = useRef(graph)
   const sizeRef = useRef(size)
   const activeLinkIdRef = useRef(activeLinkId)
+  const activeHostRef = useRef(selectedHost)
   const frameNowRef = useRef(Date.now())
   // World-space polyline + spatial-grid cache, invalidated by sim version.
   const polyCacheRef = useRef({ version: -1, map: new Map(), grid: null })
   graphRef.current = graph
   sizeRef.current = size
   activeLinkIdRef.current = activeLinkId
+  activeHostRef.current = selectedHost
 
   const linkById = useMemo(() => {
     const m = new Map()
@@ -117,8 +127,11 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
   // The pulse only matters where per-bucket ribbons are actually drawn. In
   // dense (LOD) graphs non-focused links are single segments, so a global pulse
   // would repaint thousands of links 6×/s for nothing. Restrict it to small,
-  // lossy graphs.
-  const pulseEnabled = hasLossyLinks && (graph?.links?.length ?? 0) <= LOD_LINK_THRESHOLD
+  // lossy graphs — OR when a host is pinned (only its handful of links render
+  // as full ribbons, so animating their glow is cheap and aids investigation).
+  const pulseEnabled =
+    hasLossyLinks &&
+    ((graph?.links?.length ?? 0) <= LOD_LINK_THRESHOLD || Boolean(selectedHost))
 
   // Resize observer.
   useEffect(() => {
@@ -196,16 +209,32 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     frameNowRef.current = frameNow
     const focusNode = hoverNode
 
-    // A node or link is "focused" when hovered. Dimming only kicks in then.
-    const hasFocus = Boolean(activeLink) || Boolean(focusNode)
+    // A pinned host is a PERSISTENT focus: only valid if it still exists in the
+    // current data. Its links are always shown in full per-bucket detail (no
+    // LOD), its neighbourhood stays lit and the rest of the cloud dims so the
+    // host can be investigated end-to-end.
+    const selHost =
+      activeHostRef.current && layout.positions.has(activeHostRef.current)
+        ? activeHostRef.current
+        : null
+    const hostNeighbours = selHost ? adjacency.get(selHost) : null
+    const isHostLink = (l) => selHost != null && (l.source === selHost || l.target === selHost)
+
+    // A node or link is "focused" when hovered, OR when it belongs to the
+    // pinned host. Dimming kicks in whenever any focus is active.
+    const hasFocus = Boolean(selHost) || Boolean(activeLink) || Boolean(focusNode)
     const neighbours = focusNode ? adjacency.get(focusNode) : null
 
     const linkInFocus = (l) => {
+      // With a pinned host, "focus" = the host's links (the hovered one of them
+      // is emphasised further below); never another node's links.
+      if (selHost) return isHostLink(l)
       if (activeLink) return l.id === activeLink.id
       if (focusNode) return l.source === focusNode || l.target === focusNode
       return false
     }
     const nodeInFocus = (id) => {
+      if (selHost) return id === selHost || (hostNeighbours?.has(id) ?? false)
       if (activeLink) return activeLink.source === id || activeLink.target === id
       if (focusNode) return id === focusNode || (neighbours?.has(id) ?? false)
       return false
@@ -229,8 +258,14 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       if (dense && !isFocused) {
         drawLinkSimple(ctx, l, pts, w2s, k, { dimmed: hasFocus })
       } else {
+        // When a host is pinned, the single hovered/clicked link is the only
+        // one drawn as "hovered" (thicker); the host's other links are full
+        // ribbons but not emphasised.
+        const emphasised = selHost
+          ? Boolean(activeLink) && l.id === activeLink.id
+          : isFocused
         drawLinkRibbon(ctx, l, pts, w2s, k, {
-          hovered: isFocused,
+          hovered: emphasised,
           dimmed: hasFocus && !isFocused,
           showRail,
           frameNow,
@@ -288,7 +323,7 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
   // Redraw when React-level inputs change (data, size, camera, pinned link).
   useEffect(() => {
     requestDraw()
-  }, [graph, size, cam, activeLinkId, requestDraw])
+  }, [graph, size, cam, activeLinkId, selectedHost, requestDraw])
 
   // Pulse only when something lossy is drawn as a ribbon: a low-rate redraw
   // clock that re-evaluates the glow phase. Healthy or dense graphs never
@@ -342,10 +377,20 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       const world = { x: sx / k + cam.x, y: sy / k + cam.y }
       const worldTol = HOVER_TOLERANCE_PX / k
       const candidates = grid ? grid.query(world.x, world.y, worldTol) : polylines.keys()
+      // With a host pinned, the cursor may only investigate THAT host's links;
+      // foreign connections are not hoverable/clickable.
+      const selHost =
+        activeHostRef.current && layout.positions.has(activeHostRef.current)
+          ? activeHostRef.current
+          : null
       let best = null
       for (const linkId of candidates) {
         const pts = polylines.get(linkId)
         if (!pts) continue
+        if (selHost) {
+          const l = linkById.get(linkId)
+          if (!l || (l.source !== selHost && l.target !== selHost)) continue
+        }
         const screenPts = pts.map((pt) => w2s(pt.x, pt.y))
         const { dist, u } = distanceToPolyline(screenPts, sx, sy)
         if (dist <= HOVER_TOLERANCE_PX && (!best || dist < best.dist)) {
@@ -354,7 +399,7 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
       }
       return best
     },
-    [layout, getPolylines, camRef],
+    [layout, getPolylines, camRef, linkById],
   )
 
   const toLocal = (evt) => {
@@ -395,7 +440,7 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     const hit = hitTest(x, y)
     if (hit?.type === 'node') {
       const world = screenToWorld(x, y)
-      dragRef.current = { mode: 'node', id: hit.id }
+      dragRef.current = { mode: 'node', id: hit.id, x0: x, y0: y }
       layout.startDrag(hit.id, world.x, world.y)
     } else if (hit?.type === 'link') {
       dragRef.current = { mode: 'maybe-brush', linkId: hit.linkId, startU: hit.u, x0: x, y0: y }
@@ -512,12 +557,27 @@ export default function GraphCanvas({ graph, activeLinkId, onEdgeHover, onEdgePi
     if (!g) return
     if (g.mode === 'node') {
       layout.endDrag(g.id)
+      // A click on a node (no meaningful drag) pins/switches the host selection.
+      const moved = Math.hypot(x - g.x0, y - g.y0)
+      if (moved <= CLICK_DRAG_THRESHOLD) {
+        onHostSelect?.(g.id)
+        onEdgePin?.(null)
+        hoverRef.current = null
+        onEdgeHover?.(null)
+        requestDraw()
+      }
     } else if (g.mode === 'maybe-brush') {
       finishBrush(g, x, y)
     } else if (g.mode === 'pan') {
-      // A click on empty space dismisses a pinned tooltip.
+      // A click on empty space clears the pinned host + tooltip.
       const moved = Math.hypot(x - g.x0, y - g.y0)
-      if (moved <= CLICK_DRAG_THRESHOLD) onEdgePin?.(null)
+      if (moved <= CLICK_DRAG_THRESHOLD) {
+        onEdgePin?.(null)
+        if (activeHostRef.current) {
+          onHostSelect?.(null)
+          requestDraw()
+        }
+      }
     }
   }
 

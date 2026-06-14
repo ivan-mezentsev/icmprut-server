@@ -9,7 +9,7 @@ const LIVE_POLL_MS = 10000
  * refresh it on an interval. Returns data plus loading/error state and a manual
  * refresh.
  */
-export function useGraphData(range, filters, minLoss) {
+export function useGraphData(range, filters, minLoss, host) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -25,7 +25,7 @@ export function useGraphData(range, filters, minLoss) {
       if (showSpinner) setLoading(true)
       try {
         const result = await fetchGraph(
-          { from: range.from, to: range.to, filters, minLoss },
+          { from: range.from, to: range.to, filters, minLoss, host },
           controller.signal,
         )
         if (reqId === reqIdRef.current) {
@@ -40,7 +40,7 @@ export function useGraphData(range, filters, minLoss) {
         if (reqId === reqIdRef.current) setLoading(false)
       }
     },
-    [range.from, range.to, filters, minLoss],
+    [range.from, range.to, filters, minLoss, host],
   )
 
   useEffect(() => {

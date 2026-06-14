@@ -277,14 +277,25 @@ export async function getGraph(req) {
   // never serialised to the browser. Nodes/degree stay intact — only links not
   // matching the filter are dropped, so no other display logic changes.
   const minLoss = clampThreshold(req.minLoss)
+  // A selected/pinned host is exempt from the threshold: ALL of its links are
+  // returned (even healthy ones) so the host can be investigated in full. Other
+  // hosts' links still obey the threshold to keep the payload small.
+  const host = typeof req.host === 'string' && req.host ? req.host : null
   const links =
-    minLoss > 0 ? graph.links.filter((l) => worstLinkLoss(l) >= minLoss) : graph.links
+    minLoss > 0
+      ? graph.links.filter(
+          (l) =>
+            worstLinkLoss(l) >= minLoss ||
+            (host != null && (l.source === host || l.target === host)),
+        )
+      : graph.links
 
   return {
     range: { from: fromMs, to: toMs, isLive },
     bucketSeconds,
     filters,
     minLoss,
+    host,
     nodes: graph.nodes,
     links,
   }

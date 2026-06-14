@@ -1,5 +1,6 @@
 const NETSPACE_VAR = 'var-netspace'
 const LOSS_VAR = 'var-loss'
+const HOST_VAR = 'var-host'
 
 function currentUrl() {
   if (typeof window === 'undefined') return null
@@ -55,8 +56,23 @@ export function readLossFromUrl(fallback) {
   return Math.max(0, Math.min(100, Math.round(n * 100) / 100))
 }
 
+/** Read the pinned host selection from the URL (var-host), or null. */
+export function readHostFromUrl() {
+  const url = currentUrl()
+  if (!url) return null
+  const raw = url.searchParams.get(HOST_VAR)
+  const trimmed = raw == null ? '' : String(raw).trim()
+  return trimmed === '' ? null : trimmed
+}
+
 /** Write Grafana-compatible URL state without reloading the page. */
-export function writeUrlState({ range, selectedNetspaces, availableNetspaces, lossThreshold }) {
+export function writeUrlState({
+  range,
+  selectedNetspaces,
+  availableNetspaces,
+  lossThreshold,
+  host,
+}) {
   const url = currentUrl()
   if (!url || !range || !selectedNetspaces || !availableNetspaces) return
 
@@ -76,6 +92,11 @@ export function writeUrlState({ range, selectedNetspaces, availableNetspaces, lo
   url.searchParams.delete(LOSS_VAR)
   if (typeof lossThreshold === 'number' && Number.isFinite(lossThreshold)) {
     url.searchParams.set(LOSS_VAR, String(lossThreshold))
+  }
+
+  url.searchParams.delete(HOST_VAR)
+  if (typeof host === 'string' && host) {
+    url.searchParams.set(HOST_VAR, host)
   }
 
   const next = `${url.pathname}${url.search}${url.hash}`
