@@ -302,14 +302,27 @@ export async function getGraph(req) {
 }
 
 /**
- * Public: metadata for filters / node universe. Cached with history TTL since
- * the participant set changes slowly.
+ * Public: metadata for filters / node universe, scoped to the SAME time window
+ * as the graph. The available nodes/netspaces/families reflect only what was
+ * actually observed within [from, to) — a host removed before the window, or a
+ * netspace that did not exist yet, simply will not appear. The TTL mirrors the
+ * graph: live windows refresh quickly, historical ones are effectively static.
+ *
+ * @param {{ from?: string|number, to?: string|number }} [req]
  */
-export async function getMeta() {
-  return cache.resolve('meta', config.cache.historyTtlMs, async () => {
+export async function getMeta(req = {}) {
+  const realNow = Date.now()
+  const nowMs = quantiseNow(realNow)
+  const { fromMs, toMs, isLive } = resolveRange(req.from ?? 'now-15m', req.to ?? 'now', nowMs)
+
+  const settling = toMs >= realNow - config.cache.settleMs
+  const ttl = isLive || settling ? config.cache.liveTtlMs : config.cache.historyTtlMs
+  const key = JSON.stringify({ kind: 'meta', fromMs, toMs })
+
+  return cache.resolve(key, ttl, async () => {
     const [nodeRows, nsRows] = await Promise.all([
-      querySql(buildMetaSql()),
-      querySql(buildNetspacesSql()),
+      querySql(buildMetaSql({ fromMs, toMs })),
+      querySql(buildNetspacesSql({ fromMs, toMs })),
     ])
     const nodes = nodeRows.map((r) => r.node).filter(Boolean)
     const netspaces = [...new Set(nsRows.map((r) => r.netspace).filter(Boolean))].sort()

@@ -61,7 +61,10 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/meta' && req.method === 'GET') {
-    const meta = await getMeta()
+    const meta = await getMeta({
+      from: url.searchParams.get('from') ?? 'now-15m',
+      to: url.searchParams.get('to') ?? 'now',
+    })
     sendJson(res, 200, meta)
     return true
   }

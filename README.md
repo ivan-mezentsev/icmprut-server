@@ -77,7 +77,11 @@ the cache.
 ## API
 
 - `GET /api/health` — liveness + cache stats.
-- `GET /api/meta` — node universe, netspaces, families.
+- `GET /api/meta?from=now-15m&to=now` — node universe, netspaces, families
+  **scoped to the time window**. The available filter values reflect only what
+  was observed within `[from, to)`, exactly like `/api/graph` (a host removed
+  before the window, or a netspace that did not exist yet, does not appear).
+  `from`/`to` default to `now-15m`/`now` and accept the same tokens as `/api/graph`.
 - `POST /api/graph` — body `{ from, to, filters: { netspaces?, families? }, maxBuckets? }`.
   `from`/`to` accept relative tokens (`now-15m`), epoch ms, or ISO strings.
   Also available as `GET /api/graph?from=now-15m&to=now&netspaces=<value>,<value>`.

@@ -26,8 +26,17 @@ async function getJson(path, signal) {
   return res.json()
 }
 
-export function fetchMeta(signal) {
-  return getJson('/api/meta', signal)
+/**
+ * Metadata (node universe + available netspaces/families) is scoped to the same
+ * time window as the graph, so the filter source matches what is on screen.
+ * @param {{ from: string|number, to: string|number }} range
+ */
+export function fetchMeta(range, signal) {
+  const params = new URLSearchParams({
+    from: String(range.from),
+    to: String(range.to),
+  })
+  return getJson(`/api/meta?${params.toString()}`, signal)
 }
 
 /**

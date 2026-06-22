@@ -31,20 +31,58 @@ export default function App() {
   const [pinnedPayload, setPinnedPayload] = useState(null)
   const stageRef = useRef(null)
   const [stageSize, setStageSize] = useState(null)
+  const metaInitialised = useRef(false)
+  const prevAvailableRef = useRef(null)
 
-  // Load metadata (node universe + available netspaces) once.
+  // Metadata (node universe + available netspaces) is scoped to the SAME time
+  // window as the graph: it reflects only what was observed in [from, to). So we
+  // reload it whenever the range changes (and poll it while the range is live),
+  // then reconcile the current netspace selection against the new universe.
+  // "All selected" (a full set) is preserved as "all" so that values appearing
+  // in a live window get included automatically; an explicit subset keeps only
+  // the values still present, falling back to "all" when nothing remains.
   useEffect(() => {
     const controller = new AbortController()
-    fetchMeta(controller.signal)
-      .then((m) => {
-        setMeta(m)
-        setSelectedNs((prev) => prev ?? readNetspacesFromUrl(m.netspaces))
-      })
-      .catch(() => {
-        /* surfaced via graph error path anyway */
-      })
-    return () => controller.abort()
-  }, [])
+    let cancelled = false
+
+    const loadMeta = () => {
+      fetchMeta(range, controller.signal)
+        .then((m) => {
+          if (cancelled) return
+          setMeta(m)
+          const available = new Set(m.netspaces)
+          const prevAvailable = prevAvailableRef.current
+          prevAvailableRef.current = m.netspaces
+          setSelectedNs((prev) => {
+            if (!metaInitialised.current) {
+              metaInitialised.current = true
+              return prev ?? readNetspacesFromUrl(m.netspaces)
+            }
+            // Preserve an "all" selection across window changes.
+            const wasAll =
+              prev == null ||
+              (prevAvailable != null && prev.size >= prevAvailable.length)
+            if (wasAll) return new Set(m.netspaces)
+            const kept = [...prev].filter((ns) => available.has(ns))
+            return kept.length > 0 ? new Set(kept) : new Set(m.netspaces)
+          })
+        })
+        .catch(() => {
+          /* surfaced via graph error path anyway */
+        })
+    }
+
+    loadMeta()
+    const intervalId = isRelative(range.to)
+      ? setInterval(loadMeta, 10000)
+      : null
+
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (intervalId) clearInterval(intervalId)
+    }
+  }, [range])
 
   // Keep browser back/forward compatible with the URL state.
   useEffect(() => {

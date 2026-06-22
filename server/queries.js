@@ -76,20 +76,34 @@ export function buildEdgeSeriesSql({ fromMs, toMs, bucketSeconds, filters }) {
 }
 
 /**
- * Lightweight metadata query: which nodes / netspaces / families exist in the
- * whole dataset (used to populate filters and the node universe).
+ * Window-scoped metadata query: which nodes exist within the selected time
+ * range (used to populate the node universe / filters). The meta endpoint is
+ * the SOURCE of available filter values, so it is bounded ONLY by time and
+ * deliberately never by netspace/family — otherwise the available list would
+ * collapse to whatever is already selected.
+ *
+ * @param {{ fromMs: number, toMs: number }} params
  */
-export function buildMetaSql() {
+export function buildMetaSql({ fromMs, toMs }) {
+  const fromNs = msToNs(fromMs)
+  const toNs = msToNs(toMs)
+  const timeClause = `time >= to_timestamp_nanos(${fromNs}) AND time < to_timestamp_nanos(${toNs})`
   return `
-    SELECT DISTINCT src AS node FROM ping
+    SELECT DISTINCT src AS node FROM ping WHERE ${timeClause}
     UNION
-    SELECT DISTINCT dst AS node FROM ping
+    SELECT DISTINCT dst AS node FROM ping WHERE ${timeClause}
     ORDER BY node ASC
   `.trim()
 }
 
-export function buildNetspacesSql() {
-  return `SELECT DISTINCT netspace, family FROM ping ORDER BY netspace, family`
+/**
+ * Window-scoped distinct netspace/family combos within the selected range.
+ * @param {{ fromMs: number, toMs: number }} params
+ */
+export function buildNetspacesSql({ fromMs, toMs }) {
+  const fromNs = msToNs(fromMs)
+  const toNs = msToNs(toMs)
+  return `SELECT DISTINCT netspace, family FROM ping WHERE time >= to_timestamp_nanos(${fromNs}) AND time < to_timestamp_nanos(${toNs}) ORDER BY netspace, family`
 }
 
 /**
